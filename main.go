@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -15,22 +17,119 @@ const valueRegister = "@R14"
 
 type Parser struct{}
 
+type Stack struct {
+	items         []string
+	returnCounter int
+}
+
+var funcStack = Stack{
+	items:         []string{"Sys.init"},
+	returnCounter: 0,
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("No file specified")
+	var instructions []string
+	var filename string
+	var err error
+
+	if len(os.Args) != 2 {
+		log.Fatal("no file or folder specified")
 	}
 
-	fileName := os.Args[1]
+	arg := os.Args[1]
+	ext := path.Ext(arg)
 
+	if ext == ".vm" {
+		instructions, err = parseFile(os.Args[1])
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		filename = strings.TrimSuffix(arg, ext) + ".asm"
+	} else if ext == "" {
+		instructions, err = loadFolder(os.Args[1])
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		filename = getFolderName() + ".asm"
+	}
+
+	save(instructions, filename)
+}
+
+func save(instructions []string, fileName string) {
+	// Save to file
+	extension := path.Ext(fileName)
+	outputFilename := strings.TrimSuffix(fileName, extension) + ".asm"
+	outputFile, err := os.Create(outputFilename)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	writer := bufio.NewWriter(outputFile)
+	defer writer.Flush()
+
+	for _, instruction := range instructions {
+		writer.WriteString(instruction)
+	}
+}
+
+func loadFolder(folderName string) ([]string, error) {
+	// If not, look for `.vm` files within the current folder and translate all of them
+	files, err := filepath.Glob("*.vm")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if len(files) == 0 {
+		log.Fatal("no .vm files found in folder")
+	}
+
+	instructions := []string{}
+
+	// If the user has passed `--bootstrap`, add the bootstrap code
+	shouldBootstrap := flag.Bool("bootstrap", false, "include bootstrapping instructions")
+	flag.Parse()
+	if *shouldBootstrap {
+		bootstrap := strings.Join([]string{
+			"@256",
+			"D=A",
+			"@SP",
+			"M=D",
+			fmt.Sprintf("@%s.Sys.init", getFolderName()),
+			"0;JMP",
+		}, "\n") + "\n"
+
+		instructions = append(instructions, bootstrap)
+	}
+
+	for _, file := range files {
+		lines, err := parseFile(file)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		instructions = append(instructions, lines...)
+	}
+
+	return instructions, nil
+}
+
+var currentFile string
+
+func parseFile(fileName string) ([]string, error) {
 	// Check first letter of filename is uppercase
 	if !strings.HasPrefix(fileName, strings.ToUpper(fileName[:1])) {
-		log.Fatal("File must start with an uppercase letter")
+		log.Fatal("file must start with an uppercase letter")
 	}
 
 	// Check extension is .vm
 	if path.Ext(fileName) != ".vm" {
-		log.Fatal("File must have .vm extension")
+		log.Fatal("file must have .vm extension")
 	}
+
+	currentFile = fileName
 
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -46,20 +145,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Save to file
-	extension := path.Ext(fileName)
-	outputFilename := strings.TrimSuffix(fileName, extension) + ".asm"
-	outputFile, err := os.Create(outputFilename)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	writer := bufio.NewWriter(outputFile)
-	defer writer.Flush()
-
-	for _, instruction := range output {
-		writer.WriteString(instruction)
-	}
+	return output, nil
 }
 
 func NewParser() *Parser {
@@ -68,6 +154,7 @@ func NewParser() *Parser {
 
 func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
 	instructions := []string{}
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
@@ -79,38 +166,69 @@ func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
 		line = strings.Split(line, "//")[0]
 		line = strings.TrimSpace(line)
 
-		parts := strings.Fields(line)
-		// Reverse the order of the `parts` of each line
-		// This is because we process them backwards, ie.
-		// push local 5 => 5, passed into `local()`, then we call `push()`
-		for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
-			parts[i], parts[j] = parts[j], parts[i]
-		}
-
-		output, err := parseCommand(parts)
+		output, err := parseCommand(line)
 		if err != nil {
 			log.Fatal(err)
 		}
 
+		instructions = append(instructions, "// "+line+"\n")
 		instructions = append(instructions, output)
 	}
 
-	infiniteLoop := strings.Join([]string{
-		"(INFINITE_LOOP)",
-		"@INFINITE_LOOP",
-		"0;JMP",
-	}, "\n")
+	endWithLoop := flag.Bool("endWithLoop", false, "end with infinite loop")
+	flag.Parse()
+	if *endWithLoop {
+		infiniteLoop := strings.Join([]string{
+			"(INFINITE_LOOP)",
+			"@INFINITE_LOOP",
+			"0;JMP",
+		}, "\n") + "\n"
 
-	instructions = append(instructions, infiniteLoop)
+		instructions = append(instructions, infiniteLoop)
+	}
 
 	return instructions, nil
 }
 
-func parseCommand(command []string) (string, error) {
+func parseCommand(line string) (string, error) {
+	command := strings.Fields(line)
+
 	first := command[0]
 
-	// Is the first part of the command a number?
-	num, err := strconv.Atoi(first)
+	switch first {
+	case "function":
+		return function(command[1], command[2])
+
+	case "call":
+		return callFunction(command[1], command[2])
+
+	case "return":
+		return returnFromFunction(), nil
+
+	case "goto":
+		return gotoLabel(command[1]), nil
+
+	case "if-goto":
+		return ifGoto(command[1]), nil
+
+	case "label":
+		return label(command[1]), nil
+	}
+
+	// If none of the above, it's either a push / pop command, or a single-part operation command
+
+	// Is this a single-part command? (ie. an operation)
+	if len(command) == 1 {
+		operation, err := operation(command[0])
+		if err != nil {
+			return "", err
+		}
+
+		return operation, nil
+	}
+
+	// Is the third part of the command a number?
+	num, err := strconv.Atoi(command[2])
 	if err == nil {
 		// Yes, so we're pushing / popping from the stack
 		second := command[1]
@@ -120,21 +238,229 @@ func parseCommand(command []string) (string, error) {
 			return "", err
 		}
 
-		stackOperation, err := stack(command[2])
+		stackOperation, err := stack(command[0])
 		if err != nil {
 			return "", err
 		}
 
-		return setup + "\n" + stackOperation + "\n", nil
+		return setup + "\n" + stackOperation, nil
 	}
 
-	// No, we're running an operation on the stack
-	operation, err := operation(first)
+	return "", fmt.Errorf("invalid command: %s", command)
+}
+
+func function(name string, nVars string) (string, error) {
+	numVars, err := strconv.Atoi(nVars)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("invalid vars for function definition (%s): %s", name, nVars)
 	}
 
-	return operation + "\n", nil
+	// Change the function context
+	funcStack.Push(name)
+
+	// Initialise all local variables to 0
+	lines := []string{
+		fmt.Sprintf("(%s)", getFolderName()+"."+name),
+	}
+
+	initLocalVariable := []string{
+		"@SP",
+		"A=M",
+		"M=0",
+		"@SP",
+		"M=M+1",
+	}
+
+	for i := 0; i < numVars; i++ {
+		lines = append(lines, initLocalVariable...)
+	}
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func callFunction(name string, nArgs string) (string, error) {
+	numArgs, err := strconv.Atoi(nArgs)
+	if err != nil {
+		return "", fmt.Errorf("invalid args to function (%s): %s", name, nArgs)
+	}
+
+	callingFuncName := funcStack.Peek()
+	returnLabel := getFolderName() + "." + callingFuncName + "$ret" + strconv.Itoa(funcStack.returnCounter)
+
+	lines := []string{
+		// Push the return address onto the stack
+		fmt.Sprintf("@%s", returnLabel),
+		"D=A",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push LCL onto the stack
+		"@LCL",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push ARG onto the stack
+		"@ARG",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push THIS onto the stack
+		"@THIS",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push THAT onto the stack
+		"@THAT",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Set new ARG
+		"@SP",
+		"D=M",
+		fmt.Sprintf("@%d", numArgs),
+		"D=D-A",
+		"@5",
+		"D=D-A",
+		"@ARG",
+		"M=D",
+
+		// Set up new LCL
+		"@SP",
+		"D=M",
+		"@LCL",
+		"M=D",
+
+		// Jump to the function
+		fmt.Sprintf("@%s", getFolderName()+"."+name),
+		"0;JMP",
+
+		// Set the return label for this call
+		fmt.Sprintf("(%s)", returnLabel),
+	}
+
+	// Increment the return counter for the next call from this function
+	funcStack.returnCounter++
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func returnFromFunction() string {
+	lines := []string{
+		// Put the return address in the location register
+		"@LCL",
+		"D=M",
+		"@5",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		locRegister,
+		"M=D",
+
+		// Take the top of the working stack and put it at @ARG
+		"@SP",
+		"M=M-1",
+		"A=M",
+		"D=M",
+		"@ARG",
+		"A=M",
+		"M=D",
+
+		// Move the stack pointer
+		"@ARG",
+		"D=M+1",
+		"@SP",
+		"M=D",
+
+		// Restore THAT
+		"@LCL",
+		"A=M-1",
+		"D=M",
+		"@THAT",
+		"M=D",
+
+		// Restore THIS
+		"@LCL",
+		"D=M",
+		"@2",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@THIS",
+		"M=D",
+
+		// Restore ARG
+		"@LCL",
+		"D=M",
+		"@3",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@ARG",
+		"M=D",
+
+		// Restore LCL
+		"@LCL",
+		"D=M",
+		"@4",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@LCL",
+		"M=D",
+
+		// Jump to the return address
+		locRegister,
+		"A=M",
+		"0;JMP",
+	}
+	// Change the function context
+	funcStack.Pop()
+
+	return strings.Join(lines, "\n")
+}
+
+func gotoLabel(label string) string {
+	lines := []string{
+		fmt.Sprintf("@%s", label),
+		"0;JMP",
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func ifGoto(label string) string {
+	lines := []string{
+		"@SP",
+		"AM=M-1",
+		"D=M",
+		fmt.Sprintf("@%s", label),
+		"D;JNE",
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func label(label string) string {
+	return fmt.Sprintf("(%s)", label) + "\n"
 }
 
 func operation(op string) (string, error) {
@@ -243,19 +569,11 @@ func pop() string {
 }
 
 func local(index int) string {
-	if index == 0 {
-		return baseLocation("LCL")
-	}
-
-	return offsetLocation("LCL", index)
+	return byPointer("@LCL", index)
 }
 
 func argument(index int) string {
-	if index == 0 {
-		return baseLocation("ARG")
-	}
-
-	return offsetLocation("ARG", index)
+	return byPointer("@ARG", index)
 }
 
 func pointer(index int) (string, error) {
@@ -274,12 +592,21 @@ func temp(index int) string {
 		return baseLocation("R5")
 	}
 
-	return offsetLocation("R5", index)
+	lines := []string{
+		fmt.Sprintf("@%d", index),
+		"D=A",
+		"@R5",
+		"D=D+A",
+		locRegister,
+		"M=D",
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 func static(index int) string {
 	lines := []string{
-		fmt.Sprintf("@%s.%d", getFilename(), index),
+		fmt.Sprintf("@%s.%d", currentFile, index),
 		"D=A",
 		locRegister,
 		"M=D",
@@ -533,19 +860,6 @@ func baseLocation(location string) string {
 	return strings.Join(lines, "\n")
 }
 
-func offsetLocation(location string, index int) string {
-	lines := []string{
-		fmt.Sprintf("@%d", index),
-		"D=A",
-		fmt.Sprintf("@%s", location),
-		"D=D+A",
-		locRegister,
-		"M=D",
-	}
-
-	return strings.Join(lines, "\n")
-}
-
 func incStackPointer() string {
 	lines := []string{
 		"@SP",
@@ -564,9 +878,24 @@ func decStackPointer() string {
 	return strings.Join(lines, "\n")
 }
 
-func getFilename() string {
-	fileName := path.Base(os.Args[1])
-	fileName = strings.TrimSuffix(fileName, path.Ext(fileName))
+func getFolderName() string {
+	// Get the name of the current folder
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	return fileName
+	return path.Base(dir)
+}
+
+func (s *Stack) Push(item string) {
+	s.items = append(s.items, item)
+}
+
+func (s *Stack) Pop() {
+	s.items = s.items[:len(s.items)-1]
+}
+
+func (s *Stack) Peek() string {
+	return s.items[len(s.items)-1]
 }
