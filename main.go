@@ -12,6 +12,11 @@ import (
 	"strings"
 )
 
+var shouldBootstrap bool
+var shouldEndWithLoop bool
+
+var pathToTranslate string
+
 const locRegister = "@R13"
 const valueRegister = "@R14"
 
@@ -32,37 +37,62 @@ func main() {
 	var filename string
 	var err error
 
-	if len(os.Args) != 2 {
+	bootstrap := flag.Bool("bootstrap", false, "include bootstrapping instructions")
+	endWithLoop := flag.Bool("endWithLoop", false, "end with infinite loop")
+	passedPath := flag.String("path", "", "path to folder or file to translate")
+	flag.Parse()
+
+	shouldBootstrap = *bootstrap
+	shouldEndWithLoop = *endWithLoop
+	pathToTranslate = *passedPath
+
+	if pathToTranslate == "" {
 		log.Fatal("no file or folder specified")
 	}
 
-	arg := os.Args[1]
-	ext := path.Ext(arg)
+	ext := path.Ext(pathToTranslate)
 
 	if ext == ".vm" {
-		instructions, err = parseFile(os.Args[1])
+		instructions, err = parseFile(pathToTranslate)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		filename = strings.TrimSuffix(arg, ext) + ".asm"
+		filename = strings.TrimSuffix(pathToTranslate, ext) + ".asm"
 	} else if ext == "" {
-		instructions, err = loadFolder(os.Args[1])
+		instructions, err = loadFolder(pathToTranslate)
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		filename = getFolderName() + ".asm"
+	} else {
+		log.Fatal("invalid file extension")
 	}
 
 	save(instructions, filename)
 }
 
 func save(instructions []string, fileName string) {
+	var saveToFolderPath string
+
+	info, err := os.Stat(pathToTranslate)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	if info.IsDir() {
+		saveToFolderPath = pathToTranslate
+	} else {
+		saveToFolderPath = filepath.Dir(pathToTranslate)
+	}
+
 	// Save to file
 	extension := path.Ext(fileName)
 	outputFilename := strings.TrimSuffix(fileName, extension) + ".asm"
-	outputFile, err := os.Create(outputFilename)
+	//fmt.Println(pathToSave + "/" + outputFilename)
+	outputFile, err := os.Create(saveToFolderPath + "/" + outputFilename)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -77,7 +107,7 @@ func save(instructions []string, fileName string) {
 
 func loadFolder(folderName string) ([]string, error) {
 	// If not, look for `.vm` files within the current folder and translate all of them
-	files, err := filepath.Glob("*.vm")
+	files, err := filepath.Glob(folderName + "/*.vm")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,19 +118,20 @@ func loadFolder(folderName string) ([]string, error) {
 
 	instructions := []string{}
 
-	// If the user has passed `--bootstrap`, add the bootstrap code
-	shouldBootstrap := flag.Bool("bootstrap", false, "include bootstrapping instructions")
-	flag.Parse()
-	if *shouldBootstrap {
+	if shouldBootstrap {
 		bootstrap := strings.Join([]string{
 			"@256",
 			"D=A",
 			"@SP",
 			"M=D",
-			fmt.Sprintf("@%s.Sys.init", getFolderName()),
-			"0;JMP",
 		}, "\n") + "\n"
 
+		init, err := callFunction("Sys.init", "0")
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		instructions = append(instructions, init)
 		instructions = append(instructions, bootstrap)
 	}
 
@@ -171,13 +202,10 @@ func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
 			log.Fatal(err)
 		}
 
-		instructions = append(instructions, "// "+line+"\n")
 		instructions = append(instructions, output)
 	}
 
-	endWithLoop := flag.Bool("endWithLoop", false, "end with infinite loop")
-	flag.Parse()
-	if *endWithLoop {
+	if shouldEndWithLoop {
 		infiniteLoop := strings.Join([]string{
 			"(INFINITE_LOOP)",
 			"@INFINITE_LOOP",
@@ -243,7 +271,7 @@ func parseCommand(line string) (string, error) {
 			return "", err
 		}
 
-		return setup + "\n" + stackOperation, nil
+		return setup + "\n" + stackOperation + "\n", nil
 	}
 
 	return "", fmt.Errorf("invalid command: %s", command)
@@ -275,7 +303,7 @@ func function(name string, nVars string) (string, error) {
 		lines = append(lines, initLocalVariable...)
 	}
 
-	return strings.Join(lines, "\n"), nil
+	return strings.Join(lines, "\n") + "\n", nil
 }
 
 func callFunction(name string, nArgs string) (string, error) {
@@ -360,7 +388,7 @@ func callFunction(name string, nArgs string) (string, error) {
 	// Increment the return counter for the next call from this function
 	funcStack.returnCounter++
 
-	return strings.Join(lines, "\n"), nil
+	return strings.Join(lines, "\n") + "\n", nil
 }
 
 func returnFromFunction() string {
@@ -435,7 +463,7 @@ func returnFromFunction() string {
 	// Change the function context
 	funcStack.Pop()
 
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func gotoLabel(label string) string {
@@ -880,11 +908,7 @@ func decStackPointer() string {
 
 func getFolderName() string {
 	// Get the name of the current folder
-	dir, err := os.Getwd()
-	if err != nil {
-		log.Fatal(err)
-	}
-
+	dir := pathToTranslate
 	return path.Base(dir)
 }
 
