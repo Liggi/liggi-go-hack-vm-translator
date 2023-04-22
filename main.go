@@ -160,7 +160,7 @@ func parseFile(fileName string) ([]string, error) {
 		log.Fatal("file must have .vm extension")
 	}
 
-	currentFile = fileName
+	currentFile = filepath.Base(fileName)
 
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -183,8 +183,208 @@ func NewParser() *Parser {
 	return &Parser{}
 }
 
+func (p *Parser) prependFunctions(instructions []string) []string {
+	// Prepend the functions
+	functions := p.createReturnRoutine()
+	functions = append(functions, p.createCallRoutine()...)
+	functions = append(functions, p.createLtRoutine()...)
+
+	return append(functions, instructions...)
+}
+
+func (p *Parser) createReturnRoutine() []string {
+	returnFunction := strings.Join([]string{
+		"(RETURN)",
+
+		// Put the return address in the location register
+		"@5",
+		"D=A",
+		"@LCL",
+		"A=M-D",
+		"D=M",
+
+		locRegister,
+		"M=D",
+
+		// Take the top of the working stack and put it at @ARG
+		"@SP",
+		"M=M-1",
+		"A=M",
+		"D=M",
+		"@ARG",
+		"A=M",
+		"M=D",
+
+		// Move the stack pointer
+		"@ARG",
+		"D=M+1",
+		"@SP",
+		"M=D",
+
+		// Restore THAT
+		"@LCL",
+		"A=M-1",
+		"D=M",
+		"@THAT",
+		"M=D",
+
+		// Restore THIS
+		"@LCL",
+		"D=M",
+		"@2",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@THIS",
+		"M=D",
+
+		// Restore ARG
+		"@LCL",
+		"D=M",
+		"@3",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@ARG",
+		"M=D",
+
+		// Restore LCL
+		"@LCL",
+		"D=M",
+		"@4",
+		"D=D-A",
+		"A=D",
+		"D=M",
+		"@LCL",
+		"M=D",
+
+		// Jump to the return address
+		locRegister,
+		"A=M",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return []string{returnFunction}
+}
+
+func (p *Parser) createCallRoutine() []string {
+	callFunction := strings.Join([]string{
+		"(CALL)",
+
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push LCL onto the stack
+		"@LCL",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push ARG onto the stack
+		"@ARG",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push THIS onto the stack
+		"@THIS",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Push THAT onto the stack
+		"@THAT",
+		"D=M",
+		"@SP",
+		"A=M",
+		"M=D",
+		"@SP",
+		"M=M+1",
+
+		// Set new ARG (numArgs is the value of the valueRegister)
+		"@SP",
+		"D=M",
+		valueRegister,
+		"D=D-M",
+		"@5",
+		"D=D-A",
+		"@ARG",
+		"M=D",
+
+		// Set up new LCL
+		"@SP",
+		"D=M",
+		"@LCL",
+		"M=D",
+
+		// Get the function from the locRegister and jump to it
+		locRegister,
+		"A=M",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return []string{callFunction}
+}
+
+func (p *Parser) createLtRoutine() []string {
+	ltFunction := strings.Join([]string{
+		"(LT)",
+		"@R15",
+		"M=D",
+
+		"@SP",
+		"AM=M-1",
+		"D=M",
+		"@SP",
+		"AM=M-1",
+		"D=M-D",
+		"M=0",
+		"@END_LT",
+		"D;JGE",
+
+		"@SP",
+		"A=M",
+		"M=-1",
+
+		"(END_LT)",
+
+		"@R15",
+		"A=M",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return []string{ltFunction}
+}
+
+func (p *Parser) prependStartInstructions(instructions []string) []string {
+	start := strings.Join([]string{
+		"@256",
+		"D=A",
+		"@SP",
+		"M=D",
+		"@START",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return append([]string{start}, instructions...)
+}
+
 func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
-	instructions := []string{}
+	instructions := []string{
+		"(START)\n",
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -204,6 +404,9 @@ func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
 
 		instructions = append(instructions, output)
 	}
+
+	instructions = p.prependFunctions(instructions)
+	instructions = p.prependStartInstructions(instructions)
 
 	if shouldEndWithLoop {
 		infiniteLoop := strings.Join([]string{
@@ -252,7 +455,7 @@ func parseCommand(line string) (string, error) {
 			return "", err
 		}
 
-		return operation, nil
+		return operation + "\n", nil
 	}
 
 	// Is the third part of the command a number?
@@ -316,69 +519,24 @@ func callFunction(name string, nArgs string) (string, error) {
 	returnLabel := getFolderName() + "." + callingFuncName + "$ret" + strconv.Itoa(funcStack.returnCounter)
 
 	lines := []string{
-		// Push the return address onto the stack
+		// Put the function address into the `locRegister`
+		fmt.Sprintf("@%s", getFolderName()+"."+name),
+		"D=A",
+		locRegister,
+		"M=D",
+
+		// Put the number of args into the `valueRegister`
+		fmt.Sprintf("@%d", numArgs),
+		"D=A",
+		valueRegister,
+		"M=D",
+
+		// Put the return address into the D register
 		fmt.Sprintf("@%s", returnLabel),
 		"D=A",
-		"@SP",
-		"A=M",
-		"M=D",
-		"@SP",
-		"M=M+1",
 
-		// Push LCL onto the stack
-		"@LCL",
-		"D=M",
-		"@SP",
-		"A=M",
-		"M=D",
-		"@SP",
-		"M=M+1",
-
-		// Push ARG onto the stack
-		"@ARG",
-		"D=M",
-		"@SP",
-		"A=M",
-		"M=D",
-		"@SP",
-		"M=M+1",
-
-		// Push THIS onto the stack
-		"@THIS",
-		"D=M",
-		"@SP",
-		"A=M",
-		"M=D",
-		"@SP",
-		"M=M+1",
-
-		// Push THAT onto the stack
-		"@THAT",
-		"D=M",
-		"@SP",
-		"A=M",
-		"M=D",
-		"@SP",
-		"M=M+1",
-
-		// Set new ARG
-		"@SP",
-		"D=M",
-		fmt.Sprintf("@%d", numArgs),
-		"D=D-A",
-		"@5",
-		"D=D-A",
-		"@ARG",
-		"M=D",
-
-		// Set up new LCL
-		"@SP",
-		"D=M",
-		"@LCL",
-		"M=D",
-
-		// Jump to the function
-		fmt.Sprintf("@%s", getFolderName()+"."+name),
+		// Jump to the call routine
+		"@CALL",
 		"0;JMP",
 
 		// Set the return label for this call
@@ -393,71 +551,7 @@ func callFunction(name string, nArgs string) (string, error) {
 
 func returnFromFunction() string {
 	lines := []string{
-		// Put the return address in the location register
-		"@LCL",
-		"D=M",
-		"@5",
-		"D=D-A",
-		"A=D",
-		"D=M",
-		locRegister,
-		"M=D",
-
-		// Take the top of the working stack and put it at @ARG
-		"@SP",
-		"M=M-1",
-		"A=M",
-		"D=M",
-		"@ARG",
-		"A=M",
-		"M=D",
-
-		// Move the stack pointer
-		"@ARG",
-		"D=M+1",
-		"@SP",
-		"M=D",
-
-		// Restore THAT
-		"@LCL",
-		"A=M-1",
-		"D=M",
-		"@THAT",
-		"M=D",
-
-		// Restore THIS
-		"@LCL",
-		"D=M",
-		"@2",
-		"D=D-A",
-		"A=D",
-		"D=M",
-		"@THIS",
-		"M=D",
-
-		// Restore ARG
-		"@LCL",
-		"D=M",
-		"@3",
-		"D=D-A",
-		"A=D",
-		"D=M",
-		"@ARG",
-		"M=D",
-
-		// Restore LCL
-		"@LCL",
-		"D=M",
-		"@4",
-		"D=D-A",
-		"A=D",
-		"D=M",
-		"@LCL",
-		"M=D",
-
-		// Jump to the return address
-		locRegister,
-		"A=M",
+		"@RETURN",
 		"0;JMP",
 	}
 	// Change the function context
@@ -678,7 +772,7 @@ func byPointer(location string, index int) string {
 		}
 	} else {
 		lines = []string{
-			fmt.Sprintf("@%d", index),
+			fmt.Sprintf("@%d", index), // this one
 			"D=A",
 			location,
 			"A=M",
@@ -804,28 +898,15 @@ func gt() string {
 var ltCount = 0
 
 func lt() string {
-	ltTrueLabel := fmt.Sprintf("LT_TRUE_%d", ltCount)
-	ltEndLabel := fmt.Sprintf("LT_END_%d", ltCount)
+
+	retAddress := fmt.Sprintf("RET_ADDRESS_LT%d", ltCount)
 
 	lines := []string{
-		"@SP",
-		"AM=M-1",
-		"D=M",
-		"@SP",
-		"AM=M-1",
-		"D=M-D",
-		fmt.Sprintf("@%s", ltTrueLabel),
-		"D;JLT",
-		"@SP",
-		"A=M",
-		"M=0",
-		fmt.Sprintf("@%s", ltEndLabel),
+		fmt.Sprintf("@%s", retAddress),
+		"D=A",
+		"@LT",
 		"0;JMP",
-		fmt.Sprintf("(%s)", ltTrueLabel),
-		"@SP",
-		"A=M",
-		"M=-1",
-		fmt.Sprintf("(%s)", ltEndLabel),
+		fmt.Sprintf("(%s)", retAddress),
 	}
 
 	ltCount++
@@ -909,6 +990,7 @@ func decStackPointer() string {
 func getFolderName() string {
 	// Get the name of the current folder
 	dir := pathToTranslate
+
 	return path.Base(dir)
 }
 
