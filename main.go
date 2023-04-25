@@ -14,6 +14,7 @@ import (
 
 var shouldBootstrap bool
 var shouldEndWithLoop bool
+var shouldSetStackPointer bool
 
 var pathToTranslate string
 
@@ -23,12 +24,12 @@ const valueRegister = "@R14"
 type Parser struct{}
 
 type Stack struct {
-	items         []string
+	current       string
 	returnCounter int
 }
 
 var funcStack = Stack{
-	items:         []string{"Sys.init"},
+	current:       "Sys.init",
 	returnCounter: 0,
 }
 
@@ -38,11 +39,13 @@ func main() {
 	var err error
 
 	bootstrap := flag.Bool("bootstrap", false, "include bootstrapping instructions")
+	setStackPointer := flag.Bool("setStackPointer", false, "set the stack pointer to 256")
 	endWithLoop := flag.Bool("endWithLoop", false, "end with infinite loop")
 	passedPath := flag.String("path", "", "path to folder or file to translate")
 	flag.Parse()
 
 	shouldBootstrap = *bootstrap
+	shouldSetStackPointer = *setStackPointer
 	shouldEndWithLoop = *endWithLoop
 	pathToTranslate = *passedPath
 
@@ -116,23 +119,17 @@ func loadFolder(folderName string) ([]string, error) {
 		log.Fatal("no .vm files found in folder")
 	}
 
-	instructions := []string{}
+	instructions := []string{
+		"(START)\n",
+	}
 
 	if shouldBootstrap {
-		bootstrap := strings.Join([]string{
-			"@256",
-			"D=A",
-			"@SP",
-			"M=D",
-		}, "\n") + "\n"
-
 		init, err := callFunction("Sys.init", "0")
 		if err != nil {
 			log.Fatal(err)
 		}
 
 		instructions = append(instructions, init)
-		instructions = append(instructions, bootstrap)
 	}
 
 	for _, file := range files {
@@ -142,6 +139,20 @@ func loadFolder(folderName string) ([]string, error) {
 		}
 
 		instructions = append(instructions, lines...)
+	}
+
+	// Needs to go here instead
+	instructions = prependFunctions(instructions)
+	instructions = prependStartInstructions(instructions)
+
+	if shouldEndWithLoop {
+		infiniteLoop := strings.Join([]string{
+			"(INFINITE_LOOP)",
+			"@INFINITE_LOOP",
+			"0;JMP",
+		}, "\n") + "\n"
+
+		instructions = append(instructions, infiniteLoop)
 	}
 
 	return instructions, nil
@@ -183,16 +194,18 @@ func NewParser() *Parser {
 	return &Parser{}
 }
 
-func (p *Parser) prependFunctions(instructions []string) []string {
+func prependFunctions(instructions []string) []string {
 	// Prepend the functions
-	functions := p.createReturnRoutine()
-	functions = append(functions, p.createCallRoutine()...)
-	functions = append(functions, p.createLtRoutine()...)
+	functions := createReturnRoutine()
+	functions = append(functions, createCallRoutine()...)
+	functions = append(functions, createLtRoutine()...)
+	functions = append(functions, createGtRoutine()...)
+	functions = append(functions, createEqRoutine()...)
 
 	return append(functions, instructions...)
 }
 
-func (p *Parser) createReturnRoutine() []string {
+func createReturnRoutine() []string {
 	returnFunction := strings.Join([]string{
 		"(RETURN)",
 
@@ -267,7 +280,7 @@ func (p *Parser) createReturnRoutine() []string {
 	return []string{returnFunction}
 }
 
-func (p *Parser) createCallRoutine() []string {
+func createCallRoutine() []string {
 	callFunction := strings.Join([]string{
 		"(CALL)",
 
@@ -338,7 +351,7 @@ func (p *Parser) createCallRoutine() []string {
 	return []string{callFunction}
 }
 
-func (p *Parser) createLtRoutine() []string {
+func createLtRoutine() []string {
 	ltFunction := strings.Join([]string{
 		"(LT)",
 		"@R15",
@@ -360,6 +373,9 @@ func (p *Parser) createLtRoutine() []string {
 
 		"(END_LT)",
 
+		"@SP",
+		"M=M+1",
+
 		"@R15",
 		"A=M",
 		"0;JMP",
@@ -368,23 +384,94 @@ func (p *Parser) createLtRoutine() []string {
 	return []string{ltFunction}
 }
 
-func (p *Parser) prependStartInstructions(instructions []string) []string {
-	start := strings.Join([]string{
+func createGtRoutine() []string {
+	gtFunction := strings.Join([]string{
+		"(GT)",
+		"@R15",
+		"M=D",
+
+		"@SP",
+		"AM=M-1",
+		"D=M",
+		"@SP",
+		"AM=M-1",
+		"D=M-D",
+		"M=0",
+		"@END_GT",
+		"D;JLE",
+
+		"@SP",
+		"A=M",
+		"M=-1",
+
+		"(END_GT)",
+
+		"@SP",
+		"M=M+1",
+
+		"@R15",
+		"A=M",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return []string{gtFunction}
+}
+
+func createEqRoutine() []string {
+	eqFunction := strings.Join([]string{
+		"(EQ)",
+		"@R15",
+		"M=D",
+
+		"@SP",
+		"AM=M-1",
+		"D=M",
+		"@SP",
+		"AM=M-1",
+		"D=M-D",
+		"M=0",
+		"@END_EQ",
+		"D;JNE",
+
+		"@SP",
+		"A=M",
+		"M=-1",
+
+		"(END_EQ)",
+
+		"@SP",
+		"M=M+1",
+
+		"@R15",
+		"A=M",
+		"0;JMP",
+	}, "\n") + "\n"
+
+	return []string{eqFunction}
+}
+
+func prependStartInstructions(instructions []string) []string {
+	setStackPointer := strings.Join([]string{
 		"@256",
 		"D=A",
 		"@SP",
 		"M=D",
+	}, "\n") + "\n"
+
+	start := strings.Join([]string{
 		"@START",
 		"0;JMP",
 	}, "\n") + "\n"
+
+	if shouldSetStackPointer {
+		return append([]string{setStackPointer, start}, instructions...)
+	}
 
 	return append([]string{start}, instructions...)
 }
 
 func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
-	instructions := []string{
-		"(START)\n",
-	}
+	instructions := []string{}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -403,19 +490,6 @@ func (p *Parser) Parse(scanner *bufio.Scanner) ([]string, error) {
 		}
 
 		instructions = append(instructions, output)
-	}
-
-	instructions = p.prependFunctions(instructions)
-	instructions = p.prependStartInstructions(instructions)
-
-	if shouldEndWithLoop {
-		infiniteLoop := strings.Join([]string{
-			"(INFINITE_LOOP)",
-			"@INFINITE_LOOP",
-			"0;JMP",
-		}, "\n") + "\n"
-
-		instructions = append(instructions, infiniteLoop)
 	}
 
 	return instructions, nil
@@ -464,20 +538,340 @@ func parseCommand(line string) (string, error) {
 		// Yes, so we're pushing / popping from the stack
 		second := command[1]
 
-		setup, err := location(second, num)
-		if err != nil {
-			return "", err
+		if command[0] == "push" {
+			return handlePush(second, num), nil
+		} else if command[0] == "pop" {
+			return handlePop(second, num), nil
 		}
 
-		stackOperation, err := stack(command[0])
-		if err != nil {
-			return "", err
-		}
-
-		return setup + "\n" + stackOperation + "\n", nil
+		return "", fmt.Errorf("invalid command: %s", command)
 	}
 
 	return "", fmt.Errorf("invalid command: %s", command)
+}
+
+func handlePush(segment string, index int) string {
+	var lines []string
+
+	switch segment {
+	case "constant":
+		lines = []string{
+			fmt.Sprintf("@%d", index),
+			"D=A",
+			"@SP",
+			"AM=M+1",
+			"A=A-1",
+			"M=D",
+		}
+
+	case "argument":
+		if index == 0 {
+			lines = []string{
+				"@ARG",
+				"A=M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@ARG",
+				"A=M",
+				"D=D+A",
+				"A=D",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		}
+
+	case "local":
+		if index == 0 {
+			lines = []string{
+				"@LCL",
+				"A=M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@LCL",
+				"A=M",
+				"D=D+A",
+				"A=D",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		}
+
+	case "static":
+		lines = []string{
+			fmt.Sprintf("@%s.%d", currentFile, index),
+			"D=M",
+			"@SP",
+			"AM=M+1",
+			"A=A-1",
+			"M=D",
+		}
+
+	case "this":
+		if index == 0 {
+			lines = []string{
+				"@THIS",
+				"A=M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@THIS",
+				"A=D+M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		}
+
+	case "that":
+		if index == 0 {
+			lines = []string{
+				"@THAT",
+				"A=M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@THAT",
+				"A=D+M",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		}
+
+	case "pointer":
+		if index == 0 {
+			lines = []string{
+				"@THIS",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		} else if index == 1 {
+			lines = []string{
+				"@THAT",
+				"D=M",
+				"@SP",
+				"AM=M+1",
+				"A=A-1",
+				"M=D",
+			}
+		}
+
+	case "temp":
+		lines = []string{
+			fmt.Sprintf("@%d", index+5),
+			"D=M",
+			"@SP",
+			"AM=M+1",
+			"A=A-1",
+			"M=D",
+		}
+	}
+
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func handlePop(segment string, index int) string {
+	var lines []string
+
+	switch segment {
+	case "argument":
+		if index == 0 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@ARG",
+				"A=M",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@ARG",
+				"A=D+M",
+				"D=A",
+				locRegister,
+				"M=D",
+
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				locRegister,
+				"A=M",
+				"M=D",
+			}
+		}
+
+	case "local":
+		if index == 0 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@LCL",
+				"A=M",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@LCL",
+				"A=D+M",
+				"D=A",
+				locRegister,
+				"M=D",
+
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				locRegister,
+				"A=M",
+				"M=D",
+			}
+		}
+
+	case "static":
+		lines = []string{
+			"@SP",
+			"AM=M-1",
+			"D=M",
+			fmt.Sprintf("@%s.%d", currentFile, index),
+			"M=D",
+		}
+
+	case "this":
+		if index == 0 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@THIS",
+				"A=M",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@THIS",
+				"A=D+M",
+				"D=A",
+				locRegister,
+				"M=D",
+
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				locRegister,
+				"A=M",
+				"M=D",
+			}
+		}
+
+	case "that":
+		if index == 0 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@THAT",
+				"A=M",
+				"M=D",
+			}
+		} else {
+			lines = []string{
+				fmt.Sprintf("@%d", index),
+				"D=A",
+				"@THAT",
+				"A=D+M",
+				"D=A",
+				locRegister,
+				"M=D",
+
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				locRegister,
+				"A=M",
+				"M=D",
+			}
+		}
+
+	case "pointer":
+		if index == 0 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@THIS",
+				"M=D",
+			}
+		} else if index == 1 {
+			lines = []string{
+				"@SP",
+				"AM=M-1",
+				"D=M",
+				"@THAT",
+				"M=D",
+			}
+		}
+
+	case "temp":
+		lines = []string{
+			"@SP",
+			"AM=M-1",
+			"D=M",
+			fmt.Sprintf("@%d", index+5),
+			"M=D",
+		}
+	}
+
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func function(name string, nVars string) (string, error) {
@@ -487,7 +881,7 @@ func function(name string, nVars string) (string, error) {
 	}
 
 	// Change the function context
-	funcStack.Push(name)
+	funcStack.current = name
 
 	// Initialise all local variables to 0
 	lines := []string{
@@ -515,7 +909,7 @@ func callFunction(name string, nArgs string) (string, error) {
 		return "", fmt.Errorf("invalid args to function (%s): %s", name, nArgs)
 	}
 
-	callingFuncName := funcStack.Peek()
+	callingFuncName := funcStack.current
 	returnLabel := getFolderName() + "." + callingFuncName + "$ret" + strconv.Itoa(funcStack.returnCounter)
 
 	lines := []string{
@@ -554,15 +948,16 @@ func returnFromFunction() string {
 		"@RETURN",
 		"0;JMP",
 	}
-	// Change the function context
-	funcStack.Pop()
 
 	return strings.Join(lines, "\n") + "\n"
 }
 
 func gotoLabel(label string) string {
+	callingFuncName := funcStack.current
+	constructedLabel := callingFuncName + "$" + label
+
 	lines := []string{
-		fmt.Sprintf("@%s", label),
+		fmt.Sprintf("@%s", constructedLabel),
 		"0;JMP",
 	}
 
@@ -570,11 +965,14 @@ func gotoLabel(label string) string {
 }
 
 func ifGoto(label string) string {
+	callingFuncName := funcStack.current
+	constructedLabel := callingFuncName + "$" + label
+
 	lines := []string{
 		"@SP",
 		"AM=M-1",
 		"D=M",
-		fmt.Sprintf("@%s", label),
+		fmt.Sprintf("@%s", constructedLabel),
 		"D;JNE",
 	}
 
@@ -582,7 +980,10 @@ func ifGoto(label string) string {
 }
 
 func label(label string) string {
-	return fmt.Sprintf("(%s)", label) + "\n"
+	callingFuncName := funcStack.current
+	constructedLabel := callingFuncName + "$" + label
+
+	return fmt.Sprintf("(%s)", constructedLabel) + "\n"
 }
 
 func operation(op string) (string, error) {
@@ -619,183 +1020,14 @@ func operation(op string) (string, error) {
 	}
 }
 
-func location(op string, index int) (string, error) {
-	switch op {
-	case "argument":
-		return argument(index), nil
-
-	case "local":
-		return local(index), nil
-
-	case "static":
-		return static(index), nil
-
-	case "constant":
-		return constant(index), nil
-
-	case "this":
-		return this(index), nil
-
-	case "that":
-		return that(index), nil
-
-	case "pointer":
-		return pointer(index)
-
-	case "temp":
-		return temp(index), nil
-
-	default:
-		return "", fmt.Errorf("invalid location: %s", op)
-	}
-}
-
-func stack(op string) (string, error) {
-	if op == "push" {
-		return push(), nil
-	} else if op == "pop" {
-		return pop(), nil
-	}
-
-	return "", fmt.Errorf("invalid stack operation: %s", op)
-}
-
-func push() string {
-	lines := []string{
-		locRegister,
-		"A=M",
-		"D=M",
-		"@SP",
-		"A=M",
-		"M=D",
-	}
-
-	lines = append(lines, incStackPointer())
-
-	return strings.Join(lines, "\n")
-}
-
-func pop() string {
-	lines := []string{
-		"@SP",
-		"A=M-1",
-		"D=M",
-		locRegister,
-		"A=M",
-		"M=D",
-	}
-
-	lines = append(lines, decStackPointer())
-
-	return strings.Join(lines, "\n")
-}
-
-func local(index int) string {
-	return byPointer("@LCL", index)
-}
-
-func argument(index int) string {
-	return byPointer("@ARG", index)
-}
-
-func pointer(index int) (string, error) {
-	if index == 0 {
-		return baseLocation("THIS"), nil
-	}
-	if index == 1 {
-		return baseLocation("THAT"), nil
-	}
-
-	return "", fmt.Errorf("invalid pointer index: %d", index)
-}
-
-func temp(index int) string {
-	if index == 0 {
-		return baseLocation("R5")
-	}
-
-	lines := []string{
-		fmt.Sprintf("@%d", index),
-		"D=A",
-		"@R5",
-		"D=D+A",
-		locRegister,
-		"M=D",
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func static(index int) string {
-	lines := []string{
-		fmt.Sprintf("@%s.%d", currentFile, index),
-		"D=A",
-		locRegister,
-		"M=D",
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func constant(index int) string {
-	lines := []string{
-		fmt.Sprintf("@%d", index),
-		"D=A",
-		valueRegister,
-		"M=D",
-		"D=A",
-		locRegister,
-		"M=D",
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-func this(index int) string {
-	return byPointer("@THIS", index)
-}
-
-func that(index int) string {
-	return byPointer("@THAT", index)
-}
-
-func byPointer(location string, index int) string {
-	var lines []string
-
-	if index == 0 {
-		lines = []string{
-			location,
-			"A=M",
-			"D=A",
-			locRegister,
-			"M=D",
-		}
-	} else {
-		lines = []string{
-			fmt.Sprintf("@%d", index), // this one
-			"D=A",
-			location,
-			"A=M",
-			"D=D+A",
-			locRegister,
-			"M=D",
-		}
-	}
-
-	return strings.Join(lines, "\n")
-}
-
 func add() string {
 	lines := []string{
 		"@SP",
 		"AM=M-1",
 		"D=M",
-		"@SP",
-		"AM=M-1",
+		"A=A-1",
 		"M=D+M",
 	}
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -805,12 +1037,9 @@ func sub() string {
 		"@SP",
 		"AM=M-1",
 		"D=M",
-		"@SP",
-		"AM=M-1",
+		"A=A-1",
 		"M=M-D",
 	}
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -820,9 +1049,9 @@ func neg() string {
 		"@SP",
 		"AM=M-1",
 		"M=-M",
+		"@SP",
+		"M=M+1",
 	}
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -830,33 +1059,17 @@ func neg() string {
 var eqCount = 0
 
 func eq() string {
-	eqTrueLabel := fmt.Sprintf("EQ_TRUE_%d", eqCount)
-	eqEndLabel := fmt.Sprintf("EQ_END_%d", eqCount)
+	retAddress := fmt.Sprintf("RET_ADDRESS_EQ%d", eqCount)
 
 	lines := []string{
-		"@SP",
-		"AM=M-1",
-		"D=M",
-		"@SP",
-		"AM=M-1",
-		"D=M-D",
-		fmt.Sprintf("@%s", eqTrueLabel),
-		"D;JEQ",
-		"@SP",
-		"A=M",
-		"M=0",
-		fmt.Sprintf("@%s", eqEndLabel),
+		fmt.Sprintf("@%s", retAddress),
+		"D=A",
+		"@EQ",
 		"0;JMP",
-		fmt.Sprintf("(%s)", eqTrueLabel),
-		"@SP",
-		"A=M",
-		"M=-1",
-		fmt.Sprintf("(%s)", eqEndLabel),
+		fmt.Sprintf("(%s)", retAddress),
 	}
 
 	eqCount++
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -864,33 +1077,17 @@ func eq() string {
 var gtCount = 0
 
 func gt() string {
-	gtTrueLabel := fmt.Sprintf("GT_TRUE_%d", gtCount)
-	gtEndLabel := fmt.Sprintf("GT_END_%d", gtCount)
+	retAddress := fmt.Sprintf("RET_ADDRESS_GT%d", gtCount)
 
 	lines := []string{
-		"@SP",
-		"AM=M-1",
-		"D=M",
-		"@SP",
-		"AM=M-1",
-		"D=M-D",
-		fmt.Sprintf("@%s", gtTrueLabel),
-		"D;JGT",
-		"@SP",
-		"A=M",
-		"M=0",
-		fmt.Sprintf("@%s", gtEndLabel),
+		fmt.Sprintf("@%s", retAddress),
+		"D=A",
+		"@GT",
 		"0;JMP",
-		fmt.Sprintf("(%s)", gtTrueLabel),
-		"@SP",
-		"A=M",
-		"M=-1",
-		fmt.Sprintf("(%s)", gtEndLabel),
+		fmt.Sprintf("(%s)", retAddress),
 	}
 
 	gtCount++
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -911,8 +1108,6 @@ func lt() string {
 
 	ltCount++
 
-	lines = append(lines, incStackPointer())
-
 	return strings.Join(lines, "\n")
 }
 
@@ -921,12 +1116,9 @@ func and() string {
 		"@SP",
 		"AM=M-1",
 		"D=M",
-		"@SP",
-		"AM=M-1",
+		"A=A-1",
 		"M=D&M",
 	}
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -936,12 +1128,9 @@ func or() string {
 		"@SP",
 		"AM=M-1",
 		"D=M",
-		"@SP",
-		"AM=M-1",
+		"A=A-1",
 		"M=D|M",
 	}
-
-	lines = append(lines, incStackPointer())
 
 	return strings.Join(lines, "\n")
 }
@@ -951,19 +1140,8 @@ func not() string {
 		"@SP",
 		"AM=M-1",
 		"M=!M",
-	}
-
-	lines = append(lines, incStackPointer())
-
-	return strings.Join(lines, "\n")
-}
-
-func baseLocation(location string) string {
-	lines := []string{
-		fmt.Sprintf("@%s", location),
-		"D=A",
-		locRegister,
-		"M=D",
+		"@SP",
+		"M=M+1",
 	}
 
 	return strings.Join(lines, "\n")
@@ -978,15 +1156,6 @@ func incStackPointer() string {
 	return strings.Join(lines, "\n")
 }
 
-func decStackPointer() string {
-	lines := []string{
-		"@SP",
-		"M=M-1",
-	}
-
-	return strings.Join(lines, "\n")
-}
-
 func getFolderName() string {
 	// Get the name of the current folder
 	dir := pathToTranslate
@@ -994,14 +1163,14 @@ func getFolderName() string {
 	return path.Base(dir)
 }
 
-func (s *Stack) Push(item string) {
-	s.items = append(s.items, item)
-}
+// func (s *Stack) Push(item string) {
+// 	s.items = append(s.items, item)
+// }
 
-func (s *Stack) Pop() {
-	s.items = s.items[:len(s.items)-1]
-}
+// func (s *Stack) Pop() {
+// 	s.items = s.items[:len(s.items)-1]
+// }
 
-func (s *Stack) Peek() string {
-	return s.items[len(s.items)-1]
-}
+// func (s *Stack) Peek() string {
+// 	return s.items[len(s.items)-1]
+// }
